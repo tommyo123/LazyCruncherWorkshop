@@ -1,0 +1,11 @@
+# `cargo msi` builds the Windows installer from wix/main.wxs.
+#
+# Build first, then package:
+#   cargo build --release
+#   cargo msi
+#
+# Needs cargo-wix (`cargo install cargo-wix`) and the WiX Toolset 3.x.
+# The MSI lands in target\wix\. CI does not use this alias; it invokes
+# candle.exe / light.exe directly (see .github/workflows/release.yml).
+[alias]
+msi = "wix -p lazy-cruncher-workshop -n lazy-cruncher-workshop --no-build --target-bin-dir target/release -I wix/main.wxs -o target/wix/"

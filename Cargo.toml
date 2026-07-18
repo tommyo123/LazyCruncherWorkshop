@@ -1,0 +1,23 @@
+[package]
+name = "lazy-cruncher-workshop"
+version = "0.9.0"
+edition = "2021"
+description = "Desktop application for creating self-extracting Commodore 64 PRG files"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/tommyo123-dev/LazyCruncherWorkshop"
+keywords = ["c64", "commodore-64", "compression", "prg"]
+categories = ["compression", "gui"]
+
+[dependencies]
+eframe = "0.35.0"
+lzan-c64 = { git = "https://github.com/tommyo123/lzan.git", version = "1.0" }
+rfd = "0.17.2"
+unidecrunch = { git = "https://github.com/tommyo123/UniDecrunch.git", version = "1.0" }
+retroviewer = { git = "https://github.com/tommyo123/RetroViewer.git", version = "1.0" }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.dev.package."*"]
+opt-level = 3

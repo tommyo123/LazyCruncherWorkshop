@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LazyCruncher Workshop - WiX installer configuration.
+
+  Installs to:
+  Program Files\LazyCruncher Workshop\
+  |- lazy-cruncher-workshop.exe (GUI)
+  |- vcruntime140.dll           (only if the VC++ Redistributable is not installed)
+
+  Shortcuts:
+  - Desktop:    LazyCruncher Workshop
+  - Start Menu: LazyCruncher Workshop
+
+  Driven from the command line with:
+    candle -dVersion=<x.y.z.0> -dCargoTargetBinDir=target\release wix\main.wxs
+-->
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+    <Product
+        Id="*"
+        Name="LazyCruncher Workshop"
+        UpgradeCode="D9C37388-2F70-49DA-88C4-982FD55164E0"
+        Manufacturer="Tommy Olsen"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package Id="*"
+            Keywords="Installer"
+            Description="Creates self-extracting Commodore 64 PRG files"
+            Manufacturer="Tommy Olsen"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252"
+            Platform="x64"
+            />
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit."/>
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1"/>
+        <Property Id="DiskPrompt" Value="LazyCruncher Workshop Installation"/>
+
+        <!-- Is the VC++ 2015-2022 x64 redistributable already installed? -->
+        <Property Id="VCREDIST_INSTALLED">
+            <RegistrySearch Id="VCRedist2015Plus_x64"
+                Root="HKLM"
+                Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                Name="Installed"
+                Type="raw" />
+        </Property>
+
+        <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+        <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize"/>
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="LazyCruncher Workshop">
+
+                    <!-- Main GUI executable -->
+                    <Component Id="MainExecutable" Guid="*">
+                        <File
+                            Id="MainExe"
+                            Name="lazy-cruncher-workshop.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\lazy-cruncher-workshop.exe"
+                            KeyPath="yes"/>
+                    </Component>
+
+                    <!-- VC++ runtime DLL - only installed if the redistributable is absent -->
+                    <Component Id="VCRuntime" Guid="*">
+                        <Condition>NOT VCREDIST_INSTALLED</Condition>
+                        <File
+                            Id="VCRuntime140"
+                            Name="vcruntime140.dll"
+                            DiskId="1"
+                            Source="external-utils\vcruntime140.dll"
+                            KeyPath="yes"/>
+                    </Component>
+
+                </Directory>
+            </Directory>
+
+            <!-- Desktop shortcut -->
+            <Directory Id="DesktopFolder" Name="Desktop">
+                <Component Id="DesktopShortcut" Guid="F69539D6-3936-431D-B28A-4A0EE5B9D936">
+                    <Shortcut
+                        Id="DesktopShortcut"
+                        Name="LazyCruncher Workshop"
+                        Description="Create self-extracting Commodore 64 PRG files"
+                        Target="[APPLICATIONFOLDER]lazy-cruncher-workshop.exe"
+                        WorkingDirectory="APPLICATIONFOLDER"/>
+                    <RemoveFolder Id="RemoveDesktopFolder" On="uninstall"/>
+                    <RegistryValue
+                        Root="HKCU"
+                        Key="Software\Commodore 64 Tools\LazyCruncher Workshop"
+                        Name="DesktopShortcut"
+                        Type="integer"
+                        Value="1"
+                        KeyPath="yes"/>
+                </Component>
+            </Directory>
+
+            <!-- Start Menu shortcut -->
+            <Directory Id="ProgramMenuFolder">
+                <Directory Id="ApplicationProgramsFolder" Name="LazyCruncher Workshop">
+                    <Component Id="StartMenuShortcuts" Guid="2296FF38-F0AD-4610-86FC-FFA3FD0DD39C">
+                        <Shortcut
+                            Id="ApplicationStartMenuShortcut"
+                            Name="LazyCruncher Workshop"
+                            Description="Create self-extracting Commodore 64 PRG files"
+                            Target="[APPLICATIONFOLDER]lazy-cruncher-workshop.exe"
+                            WorkingDirectory="APPLICATIONFOLDER"/>
+                        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall"/>
+                        <RegistryValue
+                            Root="HKCU"
+                            Key="Software\Commodore 64 Tools\LazyCruncher Workshop"
+                            Name="StartMenuShortcut"
+                            Type="integer"
+                            Value="1"
+                            KeyPath="yes"/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id="Complete"
+            Title="LazyCruncher Workshop"
+            Description="Complete installation of LazyCruncher Workshop."
+            Level="1"
+            ConfigurableDirectory="APPLICATIONFOLDER"
+            AllowAdvertise="no"
+            Display="expand"
+            Absent="disallow">
+
+            <ComponentRef Id="MainExecutable"/>
+            <ComponentRef Id="VCRuntime"/>
+
+            <Feature
+                Id="Shortcuts"
+                Title="Desktop and Start Menu Shortcuts"
+                Description="Creates shortcuts on the Desktop and in the Start Menu."
+                Level="1">
+                <ComponentRef Id="DesktopShortcut"/>
+                <ComponentRef Id="StartMenuShortcuts"/>
+            </Feature>
+        </Feature>
+
+        <Property Id="ARPPRODUCTICON" Value="ProductICO" />
+        <Property Id="ARPURLINFOABOUT" Value="https://github.com/tommyo123-dev/LazyCruncherWorkshop"/>
+        <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />
+
+        <Icon Id="ProductICO" SourceFile="icons\icon.ico"/>
+
+        <UI>
+            <UIRef Id="WixUI_InstallDir"/>
+            <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+            <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>
