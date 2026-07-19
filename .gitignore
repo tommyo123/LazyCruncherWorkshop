@@ -1,2 +1,45 @@
+# Rust build output
 /target/
-/rom/
+
+# Auto-generated lockfile, not tracked for this project
+Cargo.lock
+
+# Local hidden files and directories, except checked-in tooling config
+.*
+!.gitignore
+!.gitattributes
+!.github/
+!.github/**
+
+# Compiler output: the .prg images and .s assembly listings the
+# compiler emits. The tokenized-BASIC test fixtures under test_corpus/
+# are the exception and stay tracked.
+*.prg
+*.s
+!test_corpus/*.prg
+
+# Local build byproducts
+*.tmp
+*.bak
+*.log
+*.swp
+*.swo
+
+# OS metadata
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor and tool caches
+*.rs.bk
+
+# Release artifacts and installer build output
+*.exe
+*.dll
+*.msi
+*.zip
+*.tar.gz
+*.wixobj
+*.wixpdb
+package/
+portable-package/
