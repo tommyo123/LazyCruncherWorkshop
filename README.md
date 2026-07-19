@@ -8,7 +8,7 @@ file.
 ## Features
 
 - Creates self-extracting C64 PRG files from one or more input regions.
-- Supports the compression formats provided by `lzan-c64`.
+- Supports the compression formats provided by lzan-library.
 - Imports supported crunched PRG files through UniDecrunch.
 - Exports the current memory image as an uncompressed PRG file.
 - Shows the generated memory layout and provides a memory viewer.
