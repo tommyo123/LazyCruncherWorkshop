@@ -29,8 +29,8 @@
 //! program. Init is always `SEI` + `LDA #$30` + `STA $01` (all 64 KB RAM).
 
 use lzan_c64::{
-    compress_for, pick_routine, pick_zp_stack_routine, Decruncher, Direction, Format, PayloadAbi,
-    RoutineSpec, Variant,
+    compress_for, pick_routine, pick_speed_routine, pick_zp_stack_routine, Decruncher, Direction,
+    Format, PayloadAbi, RoutineSpec, Variant,
 };
 
 /// Backward-layout safety margin: the packed stream starts this many bytes
@@ -375,6 +375,9 @@ pub struct Placement {
     /// with no move at all. The gap absorbs any decoder write overshoot so the
     /// decompressed output can never reach the payload or the decoder.
     pub clearance: u16,
+    /// Pick the fastest decoder for each format instead of the balanced one.
+    /// The packed stream is unchanged; only the embedded decoder body differs.
+    pub priority_speed: bool,
 }
 
 impl Default for Placement {
@@ -393,6 +396,7 @@ impl Default for Placement {
             tsc_shift: 0,
             tailoring: TailoringChoice::default(),
             clearance: DEFAULT_CLEARANCE,
+            priority_speed: false,
         }
     }
 }
@@ -671,8 +675,14 @@ fn place(
     exact: bool,
 ) -> Result<Placed, String> {
     let (span_start, span_end) = span;
-    let baseline = pick_routine(format, direction, placement.allow_illegal)
-        .ok_or_else(|| format!("no {} routine for {}", direction.as_str(), format.as_str()))?;
+    // Priority speed picks the opt-speed decoder where one exists, otherwise
+    // the balanced baseline.
+    let baseline = if placement.priority_speed {
+        pick_speed_routine(format, direction, placement.allow_illegal)
+    } else {
+        pick_routine(format, direction, placement.allow_illegal)
+    }
+    .ok_or_else(|| format!("no {} routine for {}", direction.as_str(), format.as_str()))?;
     // The pre-JMP epilogue (banking / CLI / $2D-$2E restore / CLR) is emitted
     // INSIDE the staged blob, between the JSR entry and the decoder body, so
     // its bytes must be reserved too — otherwise a scratch buffer placed just
@@ -1043,6 +1053,10 @@ pub struct SfxResult {
     /// Bytes the whole SFX shrank by choosing the tailored decoder over the
     /// standard one (0 when not tailored).
     pub decoder_saved: usize,
+    /// Size of the decoder body that was actually built, after any tailoring.
+    /// Reflects the variant the placement chose, so callers must not re-derive
+    /// it with `pick_routine`.
+    pub decoder_bytes: u16,
     /// The raw compressed stream embedded in the SFX — the compressor's output,
     /// before the SFX wrapper and any ABI prefix. Exposed so a host can export
     /// just the packed data.
@@ -1199,6 +1213,7 @@ fn inplace_effective_placement(
             lzan_c64::lzan_min_gap_backward,
             lzan_c64::lzan_min_gap_forward,
         ),
+        Format::Bolt => (lzan_c64::bolt_gap_backward, lzan_c64::bolt_gap_forward),
         _ => {
             // No exact gap function (lzan-full's decoder depends on a stripped
             // mode byte; TSCrunch's forward decoder is not read-ahead-safe and
@@ -1399,6 +1414,11 @@ pub fn build_sfx(
     // otherwise the baseline) — NOT a fresh pick_routine, which would undo the
     // placement's choice.
     let variant = placed.variant;
+    // Static body size of the chosen variant, so the result can report the
+    // decoder that actually ran.
+    let variant_code_bytes = Decruncher::with_variant(format, direction, variant)
+        .map(|d| d.spec().code_bytes)
+        .unwrap_or(0);
 
     // ---- pre-JMP epilogue (shared by every layout) --------------------------
     // Keep its assembled size in sync with `epilogue_len`, which `place` uses to
@@ -1595,6 +1615,7 @@ pub fn build_sfx(
         warnings,
         decoder_tailored,
         decoder_saved,
+        decoder_bytes: variant_code_bytes.saturating_sub(decoder_saved as u16),
         stream: stream_for_export,
         payload_moved,
     })
@@ -1702,6 +1723,7 @@ pub fn cruncher_list() -> Vec<Cruncher> {
         (ByteBoozer2, "ByteBoozer2"),
         (PuCrunch, "PuCrunch"),
         (Upkr, "upkr"),
+        (Bolt, "BoltLZ"),
     ]
     .into_iter()
     .map(|(format, label)| Cruncher { format, label })

@@ -13,6 +13,7 @@ file.
 - Exports the current memory image as an uncompressed PRG file.
 - Shows the generated memory layout and provides a memory viewer.
 - Offers legal-only decoder variants where available.
+- Can select the fastest decruncher for a format instead of the balanced one.
 
 ## Requirements
 

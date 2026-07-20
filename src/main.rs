@@ -25,7 +25,7 @@ use lzan_c64::{pick_routine, Direction, Format};
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("{} v{}", config::APP_NAME, config::VERSION))
-        .with_inner_size([720.0, 820.0])
+        .with_inner_size([900.0, 820.0])
         .with_min_inner_size([600.0, 600.0]);
     // Window icon (title bar + taskbar while running). Path is relative to this
     // source file → the project's `icons/` directory.
@@ -99,6 +99,8 @@ struct Report {
     decoder_tailored: bool,
     /// Bytes the whole SFX shrank vs the standard decoder (0 if not tailored).
     decoder_saved: usize,
+    /// Unpacking score of the decoder that actually ran.
+    decr_score: Option<f64>,
 }
 
 enum Status {
@@ -121,6 +123,8 @@ struct CompareData {
     direction: &'static str,
     /// Output size as a percentage of the summed input `.prg` size.
     ratio: f64,
+    /// Unpacking score of the decoder that actually ran.
+    decr_score: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -208,6 +212,9 @@ struct App {
     /// Allow the embedded decruncher to use undocumented (illegal) 6502
     /// opcodes (default on). Off = legal-only decoder for portability.
     allow_illegal: bool,
+    /// Pick the fastest decoder for each format instead of the balanced one.
+    /// The packed stream is unchanged; only the decoder body differs.
+    priority_speed: bool,
     /// Per-crunch decoder tailoring (Exomizer only): Auto builds both the
     /// standard and the trait-tailored decoder and keeps the smaller.
     tailoring_choice: TailoringChoice,
@@ -277,6 +284,7 @@ impl App {
             run_basic: false,
             dir_choice: DirectionChoice::Auto,
             allow_illegal: true,
+            priority_speed: false,
             tailoring_choice: TailoringChoice::Auto,
             status: Status::Idle,
             rx: None,
@@ -355,6 +363,7 @@ impl App {
         self.run_basic = false;
         self.dir_choice = DirectionChoice::Auto;
         self.allow_illegal = true;
+        self.priority_speed = false;
         self.tailoring_choice = TailoringChoice::Auto;
         self.mem_view = None;
         self.mem_view_open = false;
@@ -955,6 +964,7 @@ impl App {
             restore_basic_end,
             basic_clr,
             allow_illegal: self.allow_illegal,
+            priority_speed: self.priority_speed,
             tsc_shift: 0, // computed per stream during the build
             tailoring: self.tailoring_choice,
             clearance,
@@ -990,6 +1000,20 @@ impl App {
         pick_routine(fmt, Direction::Forward, self.allow_illegal).map(|s| s.code_bytes as u32)
     }
 
+    /// The direction that would be used for the current image and format, so
+    /// the shown unpacking score matches the decoder that will run. Falls back
+    /// to forward when no file is loaded.
+    fn effective_direction(&self, fmt: Format) -> Direction {
+        if let Ok(p) = self.placement() {
+            if let Ok(pp) = plan_preview(&self.image, fmt, &p) {
+                if pp.unavailable.is_none() {
+                    return pp.direction;
+                }
+            }
+        }
+        Direction::Forward
+    }
+
     /// Dropdown text for cruncher `i`: the bare name plus benchmarked speeds and
     /// the live decoder size, all inside the parentheses.
     fn cruncher_entry(&self, i: usize) -> String {
@@ -997,12 +1021,13 @@ impl App {
         let dec = self
             .decoder_bytes(fmt)
             .map(|b| format!("{b} B"))
-            .unwrap_or_else(|| "—".into());
+            .unwrap_or_else(|| "-".into());
+        let dir = self.effective_direction(fmt);
         format!(
             "{}  (packing speed {}, unpacking speed {}, decoder {dec})",
             self.crunchers[i].label,
             ranks::score_str(ranks::pack_speed(fmt)),
-            ranks::score_str(ranks::decr_speed(fmt)),
+            ranks::score_str(ranks::decr_speed(fmt, self.priority_speed, dir)),
         )
     }
 
@@ -1032,7 +1057,6 @@ impl App {
 
         let format = self.crunchers[self.format_idx].format;
         let label = short_label(self.crunchers[self.format_idx].label).to_string();
-        let allow_illegal = self.allow_illegal;
         let image = self.image.clone();
         let input_len: usize = image.regions().iter().map(|r| r.data.len() + 2).sum();
         self.log(LogKind::Info, format!("Crunching with {label}…"));
@@ -1050,14 +1074,11 @@ impl App {
             }));
             let outcome = match built {
                 Ok(Ok(result)) => match std::fs::write(&output_path, &result.prg) {
-                    Ok(()) => Outcome::Ok(report_of(
-                        result,
-                        input_len,
-                        output_path,
-                        label,
-                        format,
-                        allow_illegal,
-                    )),
+                    Ok(()) => {
+                        let decr_score =
+                            ranks::decr_speed(format, placement.priority_speed, result.direction);
+                        Outcome::Ok(report_of(result, input_len, output_path, label, decr_score))
+                    }
                     Err(e) => Outcome::Err(format!("Could not write output file: {e}")),
                 },
                 Ok(Err(e)) => Outcome::Err(e),
@@ -1193,12 +1214,13 @@ impl App {
                 self.log(
                     LogKind::Good,
                     format!(
-                        "{}: {} → {} B ({ratio:.1}%, saved {saved} B); stream {} B, {}, {}",
+                        "{}: {} → {} B ({ratio:.1}%, saved {saved} B); stream {} B, {}, unpack {}, {}",
                         r.format_label,
                         r.input_len,
                         r.output_len,
                         r.stream_len,
                         decoder_note,
+                        ranks::score_str(r.decr_score),
                         r.direction
                     ),
                 );
@@ -1349,8 +1371,14 @@ impl App {
             Ok(d) => self.log(
                 LogKind::Info,
                 format!(
-                    "  {:<11} {:>6} B  {:>5.1}%  stream {:>6} B  decoder {:>3} B  {}",
-                    row.label, d.total_len, d.ratio, d.stream_len, d.decoder_bytes, d.direction
+                    "  {:<11} {:>6} B  {:>5.1}%  stream {:>6} B  decoder {:>3} B  unpack {:>7}  {}",
+                    row.label,
+                    d.total_len,
+                    d.ratio,
+                    d.stream_len,
+                    d.decoder_bytes,
+                    ranks::score_str(d.decr_score),
+                    d.direction
                 ),
             ),
             // A build failure here means the format simply cannot fit this
@@ -1383,13 +1411,14 @@ impl App {
             self.log(
                 if i == 0 { LogKind::Good } else { LogKind::Info },
                 format!(
-                    "  {:>2}. {:<11} {:>6} B  {:>5.1}%  stream {:>6} B  decoder {:>3} B  {:<8}  {}",
+                    "  {:>2}. {:<11} {:>6} B  {:>5.1}%  stream {:>6} B  decoder {:>3} B  unpack {:>7}  {:<8}  {}",
                     i + 1,
                     r.label,
                     d.total_len,
                     d.ratio,
                     d.stream_len,
                     d.decoder_bytes,
+                    ranks::score_str(d.decr_score),
                     d.direction,
                     tag
                 ),
@@ -1426,18 +1455,14 @@ fn compare_build(
     }));
     match built {
         Ok(Ok(r)) => {
-            // Report the ACTUAL decoder size: when Auto picked the tailored
-            // Exomizer body, subtract what it saved from the static baseline so
-            // the column matches the built .prg (same logic as `report_of`).
-            let static_bytes = pick_routine(fmt, r.direction, placement.allow_illegal)
-                .map(|s| s.code_bytes)
-                .unwrap_or(0);
-            let decoder_bytes = static_bytes.saturating_sub(r.decoder_saved as u16);
+            // Size of the decoder the build actually used, taken from the
+            // result so it cannot drift from the built .prg.
             Ok(CompareData {
                 total_len: r.prg.len(),
                 stream_len: r.stream_len,
-                decoder_bytes,
+                decoder_bytes: r.decoder_bytes,
                 direction: dir_str(r.direction),
+                decr_score: ranks::decr_speed(fmt, placement.priority_speed, r.direction),
                 ratio: if input_len > 0 {
                     r.prg.len() as f64 / input_len as f64 * 100.0
                 } else {
@@ -1468,21 +1493,16 @@ fn report_of(
     input_len: usize,
     output_path: PathBuf,
     format_label: String,
-    format: Format,
-    allow_illegal: bool,
+    decr_score: Option<f64>,
 ) -> Report {
-    let static_bytes = pick_routine(format, r.direction, allow_illegal)
-        .map(|s| s.code_bytes)
-        .unwrap_or(0);
-    // When tailored, the real decoder is smaller than the static baseline by the
-    // same bytes the whole SFX shrank (only the body changed).
-    let decoder_bytes = static_bytes.saturating_sub(r.decoder_saved as u16);
     Report {
         format_label,
         input_len,
         output_len: r.prg.len(),
         stream_len: r.stream_len,
-        decoder_bytes,
+        // Size of the decoder the build used, straight from the result.
+        decoder_bytes: r.decoder_bytes,
+        decr_score,
         direction: dir_str(r.direction),
         packed_at: r.packed_at,
         decruncher_at: r.decruncher_at,
@@ -2195,6 +2215,19 @@ impl App {
                 );
             if !self.allow_illegal {
                 ui.weak("legal-only decoder (no undocumented opcodes)");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.priority_speed, "Decruncher priority speed")
+                .on_hover_text(
+                    "On: pick the fastest decruncher for the format, which is usually a bit \
+                     larger.\n\
+                     Off: pick the balanced, smaller decruncher. The compressed data is the \
+                     same either way; only the decruncher differs.",
+                );
+            if self.priority_speed {
+                ui.weak("fastest decruncher (larger)");
             }
         });
     }
