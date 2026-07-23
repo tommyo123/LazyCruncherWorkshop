@@ -2,6 +2,12 @@
 
 Notable changes, newest first.
 
+## [0.9.2] - 2026-07-23
+
+### Fixed
+
+- Fixed a reliability issue affecting BASIC RUN in some configurations.
+
 ## [0.9.1] - 2026-07-20
 
 ### Added

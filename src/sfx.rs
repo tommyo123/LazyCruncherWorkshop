@@ -687,16 +687,19 @@ fn place(
     // INSIDE the staged blob, between the JSR entry and the decoder body, so
     // its bytes must be reserved too — otherwise a scratch buffer placed just
     // above the decoder can silently overlap the decoder's tail.
-    let staged_for =
-        |spec: &RoutineSpec| spec.code_bytes as u32 + STAGE_WRAPPER + epilogue_len(placement);
+    let clear_zp0800 = clears_zp0800(placement, direction, span_start);
+    let staged_for = |spec: &RoutineSpec| {
+        spec.code_bytes as u32 + STAGE_WRAPPER + epilogue_len(placement, clear_zp0800)
+    };
     // The staged blob's EXACT wrapper is JSR entry (3) + JMP done (3);
     // STAGE_WRAPPER carries extra planning slack on top. The zp-stack
     // eligibility check uses the exact number (+2 safety) — the whole point
     // of that variant is squeezing into the $0100 slot, and the slack was
     // costing it the fit (211 + 16 > 224, while the real blob is 217).
     const ZP_STACK_WRAPPER: u32 = 8;
-    let staged_zp =
-        |spec: &RoutineSpec| spec.code_bytes as u32 + ZP_STACK_WRAPPER + epilogue_len(placement);
+    let staged_zp = |spec: &RoutineSpec| {
+        spec.code_bytes as u32 + ZP_STACK_WRAPPER + epilogue_len(placement, clear_zp0800)
+    };
     // Prefer the extra-small stack-page variant (pucrunch forward) when the
     // decoder address is AUTO and the whole staged blob fits the $0100 slot —
     // it trades cycles for the bytes that let it live in guaranteed-free RAM.
@@ -1265,14 +1268,23 @@ fn inplace_effective_placement(
     }
 }
 
+/// Whether the RUN epilogue must clear `$0800`. A backward decrunch of a
+/// program at `$0801` leaves a packed byte there (the stream is moved below the
+/// start), and BASIC RUN needs it to be zero. Forward layouts leave it alone.
+fn clears_zp0800(p: &Placement, direction: Direction, span_start: u32) -> bool {
+    p.basic_clr && direction == Direction::Backward && span_start == 0x0801
+}
+
 /// Bytes the pre-JMP epilogue assembles to. MUST stay in sync with the
 /// `post` fragment emitted in [`build_sfx`] — `place` reserves this much
-/// extra room inside the staged decoder blob.
-fn epilogue_len(p: &Placement) -> u32 {
+/// extra room inside the staged decoder blob. `clear_zp0800` is
+/// [`clears_zp0800`] for the chosen direction.
+fn epilogue_len(p: &Placement, clear_zp0800: bool) -> u32 {
     (if p.restore_basic_end.is_some() { 8 } else { 0 })   // LDA/STA $2D + LDA/STA $2E
         + (if p.bank_at_jmp != INIT_BANK { 4 } else { 0 }) // LDA #imm / STA $01
         + (if p.basic_clr { 3 } else { 0 })                // JSR $A659
-        + (if p.cli_before_jmp { 1 } else { 0 }) // CLI
+        + (if p.cli_before_jmp { 1 } else { 0 })           // CLI
+        + (if clear_zp0800 { 5 } else { 0 }) // LDA #$00 / STA $0800
 }
 
 /// Whether the decompressed span overwrites the IRQ vector at `$0314/15`
@@ -1432,6 +1444,10 @@ pub fn build_sfx(
             end & 0xFF,
             end >> 8
         ));
+    }
+    if clears_zp0800(placement, direction, span_start) {
+        // $0800 (the byte before the program start) must be zero for RUN.
+        post.push_str("        LDA #$00\n        STA $0800\n");
     }
     if placement.bank_at_jmp != INIT_BANK {
         post.push_str(&format!(
@@ -2368,10 +2384,53 @@ mod tests {
             let r = build_sfx(&img, LzanFull, 0x0801, &p).unwrap();
             assert_eq!(
                 r.prg.len(),
-                base.prg.len() + epilogue_len(&p) as usize,
+                base.prg.len() + epilogue_len(&p, false) as usize,
                 "epilogue_len disagrees with emitted bytes for {p:?}",
             );
         }
+    }
+
+    /// A backward decrunch of a program at $0801 leaves a packed byte at
+    /// $0800, so the RUN epilogue clears it; `epilogue_len` counts those bytes.
+    #[test]
+    fn backward_basic_run_clears_zp0800() {
+        let run = Placement {
+            basic_clr: true,
+            ..Placement::default()
+        };
+        assert!(clears_zp0800(&run, Direction::Backward, 0x0801));
+        assert!(!clears_zp0800(&run, Direction::Forward, 0x0801));
+        assert!(!clears_zp0800(&run, Direction::Backward, 0x1000));
+        assert!(!clears_zp0800(
+            &Placement::default(),
+            Direction::Backward,
+            0x0801
+        ));
+
+        let mut img = MemoryImage::default();
+        img.add_prg("a.prg", &prg_bytes(0x0801, &compressible(4096)))
+            .unwrap();
+        let back = Placement {
+            direction: DirectionChoice::Backward,
+            ..Placement::default()
+        };
+        let back_run = Placement {
+            direction: DirectionChoice::Backward,
+            restore_basic_end: Some(0x1801),
+            bank_at_jmp: RUN_BASIC_BANK,
+            basic_clr: true,
+            cli_before_jmp: true,
+            ..Placement::default()
+        };
+        let base = build_sfx(&img, Zx02, 0x0801, &back).unwrap();
+        let run = build_sfx(&img, Zx02, RUN_BASIC_LOOP, &back_run).unwrap();
+        assert_eq!(run.direction, Direction::Backward);
+        // The only difference from the no-epilogue backward build is the
+        // epilogue, including the 5-byte $0800 clear.
+        assert_eq!(
+            run.prg.len(),
+            base.prg.len() + epilogue_len(&back_run, true) as usize
+        );
     }
 
     /// The staged-size estimate includes the option epilogue, and the auto
@@ -2392,7 +2451,7 @@ mod tests {
         // Options grow the staged reservation by exactly their epilogue length.
         let d = plan_preview(&img, LzanFull, &Placement::default()).unwrap();
         let r = plan_preview(&img, LzanFull, &run).unwrap();
-        assert_eq!(r.staged_size, d.staged_size + epilogue_len(&run));
+        assert_eq!(r.staged_size, d.staged_size + epilogue_len(&run, false));
         // For every format, an auto decoder at $0100 fits the slot in both
         // the plain and full-RUN placements.
         for c in cruncher_list() {
