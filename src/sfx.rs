@@ -595,6 +595,35 @@ fn auto_pool(cuts: &[Block]) -> Vec<Block> {
     segs
 }
 
+/// Bytes reserved for the relocated exit code.
+const EXIT_SLOT: u32 = 12;
+
+/// Whether `addr` stops being RAM once `$01` holds `bank`, per the PLA table:
+/// BASIC needs LORAM and HIRAM, `$D000` shows I/O or CHARGEN whenever LORAM or
+/// HIRAM is set, and the KERNAL needs HIRAM.
+fn banked_out(addr: u32, bank: u8) -> bool {
+    let (loram, hiram) = (bank & 0x01 != 0, bank & 0x02 != 0);
+    match addr {
+        0xA000..=0xBFFF => loram && hiram,
+        0xD000..=0xDFFF => loram || hiram,
+        0xE000..=0xFFFF => hiram,
+        _ => false,
+    }
+}
+
+/// Size of the writer that pokes the exit code into place: one
+/// `LDA #imm / STA abs` pair per emitted byte. Keep in sync with the writer in
+/// [`build_sfx`].
+fn trampoline_cost(p: &Placement) -> u32 {
+    5 * (exit_code_len(p) as u32)
+}
+
+/// Bytes of relocated exit code: `LDA #bank`, `STA $01`, an optional `CLI`, an
+/// optional `JSR` to BASIC's CLR, and the final `JMP`.
+fn exit_code_len(p: &Placement) -> usize {
+    4 + usize::from(p.cli_before_jmp) + 3 * usize::from(p.basic_clr) + 3
+}
+
 /// First-fit into the pool, skipping already-placed blocks; `page` rounds the
 /// candidate up to a page boundary.
 fn first_fit(pool: &[Block], used: &[Block], len: u32, page: bool) -> Option<u32> {
@@ -820,7 +849,7 @@ fn place(
     // Room for the folded copy loop(s) inside the staged blob (one payload
     // move; the biased/descending loop is <= 23 bytes, keep headroom).
     const MOVER_FOLD: u32 = 28;
-    let staged = base_staged + if mover_folded { MOVER_FOLD } else { 0 };
+    let folded_staged = base_staged + if mover_folded { MOVER_FOLD } else { 0 };
     // Decoder/mover blobs are INSTALLED while the program image is still
     // intact, so their pool must avoid it. The scratch buffer is different:
     // it is first written during DECODE, after the payload move has emptied
@@ -832,36 +861,53 @@ fn place(
     let mut used: Vec<Block> = Vec::new();
 
     // ---- decoder ----
-    let decr_at = match placement.decruncher {
-        Some(a) => {
-            let b = Block {
-                start: a as u32,
-                end: a as u32 + staged,
-            };
-            if b.overlaps(&span_b) || b.overlaps(&packed_b) {
-                return Err(format!(
-                    "the decoder at ${a:04X} (+{staged} B) collides with the output span or \
-                     packed data"
-                ));
+    // A blob placed in banked memory needs room for the exit-code writer, and
+    // that reservation changes where the blob fits. Settle the two against each
+    // other; the loop runs at most twice, and keeping a reservation the final
+    // address no longer needs only leaves the blob smaller than planned.
+    let mut exit_reserve = 0u32;
+    let (decr_at, staged) = loop {
+        let staged = folded_staged + exit_reserve;
+        let at = match placement.decruncher {
+            Some(a) => {
+                let b = Block {
+                    start: a as u32,
+                    end: a as u32 + staged,
+                };
+                if b.overlaps(&span_b) || b.overlaps(&packed_b) {
+                    return Err(format!(
+                        "the decoder at ${a:04X} (+{staged} B) collides with the output span or \
+                         packed data"
+                    ));
+                }
+                if a != 0x0100 && (a as u32) < 0x0200 {
+                    return Err(format!(
+                        "the decoder address ${a:04X} is in the stack/zero page"
+                    ));
+                }
+                a as u32
             }
-            if a != 0x0100 && (a as u32) < 0x0200 {
-                return Err(format!(
-                    "the decoder address ${a:04X} is in the stack/zero page"
-                ));
+            None => {
+                // The stack-page rule for small decoders: the full staged size
+                // (decoder + wrapper + option epilogue) must fit $0100-$01DF,
+                // otherwise relocate to a free slot.
+                if staged <= STACK_PAGE_SLOT {
+                    0x0100
+                } else {
+                    first_fit(&pool, &used, staged, false)
+                        .ok_or_else(|| format!("no free space for the decoder ({staged} B)"))?
+                }
             }
-            a as u32
+        };
+        let want = if placement.bank_at_jmp != INIT_BANK && banked_out(at, placement.bank_at_jmp) {
+            trampoline_cost(placement)
+        } else {
+            0
+        };
+        if want <= exit_reserve {
+            break (at, staged);
         }
-        None => {
-            // The stack-page rule for small decoders: the full staged size
-            // (decoder + wrapper + option epilogue) must fit $0100-$01DF,
-            // otherwise relocate to a free slot.
-            if staged <= STACK_PAGE_SLOT {
-                0x0100
-            } else {
-                first_fit(&pool, &used, staged, false)
-                    .ok_or_else(|| format!("no free space for the decoder ({staged} B)"))?
-            }
-        }
+        exit_reserve = want;
     };
     used.push(Block {
         start: decr_at,
@@ -958,11 +1004,47 @@ fn place(
         None
     };
 
+    // ---- exit trampoline ----
+    // The pre-JMP epilogue is emitted inside the staged blob. When the final
+    // `$01` write banks that blob out, the store removes the code that is
+    // running it and the next opcode fetch reads I/O or ROM. Put the epilogue
+    // in memory that stays RAM in every banking mode instead. It is written
+    // after the decrunch, so it must also be clear of the output span.
+    let exit_at = if placement.bank_at_jmp != INIT_BANK && banked_out(decr_at, placement.bank_at_jmp)
+    {
+        let len = EXIT_SLOT;
+        let free = |a: u32| {
+            let b = Block {
+                start: a,
+                end: a + len,
+            };
+            !b.overlaps(&span_b) && !b.overlaps(&packed_b) && !used.iter().any(|u| b.overlaps(u))
+        };
+        let at = [0x0100u32, DEFAULT_MOVER as u32]
+            .into_iter()
+            .find(|&a| free(a))
+            .ok_or_else(|| {
+                format!(
+                    "the decoder has to be staged at ${decr_at:04X}, which $01=${:02X} banks out, \
+                     and neither $0100 nor ${DEFAULT_MOVER:04X} is free for the exit code",
+                    placement.bank_at_jmp
+                )
+            })?;
+        used.push(Block {
+            start: at,
+            end: at + len,
+        });
+        Some(at as u16)
+    } else {
+        None
+    };
+
     Ok(Placed {
         staged,
         packed_start,
         decr_at: decr_at as u16,
         scratch,
+        exit_at,
         mover_at,
         mover_folded,
         variant: spec.variant,
@@ -974,6 +1056,9 @@ struct Placed {
     packed_start: u32,
     decr_at: u16,
     scratch: Option<(u16, u16)>,
+    /// Address the pre-JMP epilogue is relocated to when the staged blob sits
+    /// in memory the final `$01` value banks out.
+    exit_at: Option<u16>,
     mover_at: Option<u16>,
     /// The payload move overwrites the program image and its copy code is
     /// folded into the staged decoder blob (no separate mover placement).
@@ -1449,18 +1534,44 @@ pub fn build_sfx(
         // $0800 (the byte before the program start) must be zero for RUN.
         post.push_str("        LDA #$00\n        STA $0800\n");
     }
-    if placement.bank_at_jmp != INIT_BANK {
-        post.push_str(&format!(
-            "        LDA #${:02X}\n        STA $01\n",
-            placement.bank_at_jmp
-        ));
-    }
-    if placement.basic_clr {
-        post.push_str(&format!("        JSR ${BASIC_CLR:04X}\n"));
-    }
-    if placement.cli_before_jmp {
-        post.push_str("        CLI\n");
-    }
+    // The banking / CLR / CLI tail and the final JMP run from the staged blob
+    // unless placement moved them out; then the blob only pokes them into the
+    // exit slot and jumps there.
+    let jmp_target = match placed.exit_at {
+        None => {
+            if placement.bank_at_jmp != INIT_BANK {
+                post.push_str(&format!(
+                    "        LDA #${:02X}\n        STA $01\n",
+                    placement.bank_at_jmp
+                ));
+            }
+            if placement.basic_clr {
+                post.push_str(&format!("        JSR ${BASIC_CLR:04X}\n"));
+            }
+            if placement.cli_before_jmp {
+                post.push_str("        CLI\n");
+            }
+            start_addr
+        }
+        Some(at) => {
+            let mut code: Vec<u8> = vec![0xA9, placement.bank_at_jmp, 0x85, 0x01];
+            if placement.basic_clr {
+                code.extend_from_slice(&[0x20, (BASIC_CLR & 0xFF) as u8, (BASIC_CLR >> 8) as u8]);
+            }
+            if placement.cli_before_jmp {
+                code.push(0x58);
+            }
+            code.extend_from_slice(&[0x4C, (start_addr & 0xFF) as u8, (start_addr >> 8) as u8]);
+            debug_assert_eq!(code.len(), exit_code_len(placement));
+            for (i, b) in code.iter().enumerate() {
+                post.push_str(&format!(
+                    "        LDA #${b:02X}\n        STA ${:04X}\n",
+                    at as usize + i
+                ));
+            }
+            at
+        }
+    };
 
     let prg_from = |built: &lzan_c64::Built| -> Vec<u8> {
         let mut prg = Vec::with_capacity(built.bytes.len() + 2);
@@ -1522,7 +1633,7 @@ pub fn build_sfx(
             .output(span_start as u16)
             .output_len(data.len() as u16)
             .stage_decruncher_at(decr_at)
-            .jmp_when_done(start_addr);
+            .jmp_when_done(jmp_target);
         let in_place_used =
             direction == Direction::Backward && format != Format::TsCrunch && placed.mover_folded;
         b = match direction {
@@ -1566,7 +1677,7 @@ pub fn build_sfx(
             .output(span_start as u16)
             .output_len(data.len() as u16)
             .stage_decruncher_at(decr_at)
-            .jmp_when_done(start_addr);
+            .jmp_when_done(jmp_target);
         if let Some((at, _)) = placed.scratch {
             nb = nb.scratch_address(at);
         }

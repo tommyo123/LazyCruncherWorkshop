@@ -1,6 +1,6 @@
 [package]
 name = "lazy-cruncher-workshop"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 description = "Desktop application for creating self-extracting Commodore 64 PRG files"
 license = "MIT"

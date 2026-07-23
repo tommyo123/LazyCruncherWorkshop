@@ -2,6 +2,13 @@
 
 Notable changes, newest first.
 
+## [0.9.3] - 2026-07-23
+
+### Fixed
+
+- Corrected the handover to the decrunched program for some combinations of
+  format and memory layout.
+
 ## [0.9.2] - 2026-07-23
 
 ### Fixed
